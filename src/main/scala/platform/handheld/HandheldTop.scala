@@ -5,7 +5,7 @@ import chisel3.util._
 import _root_.circt.stage.ChiselStage
 import lib.mem.{MemoryInterface, MemoryMap, RegisterMap}
 import lib.util.{FractionalDivider, ButtonFilter}
-import lib.video.{Color, ColorARGB, ColorRGB}
+import lib.video.{Color, ColorARGB, ColorRGB, FramebufferTransform, FrameRotationLatch}
 import net.gamebub.framework.{Core, CoreException}
 import net.gamebub.framework.interface._
 import platform.handheld.display._
@@ -229,6 +229,13 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     }
     case Some(x) => throw new CoreException("Unknown 'video': " + x.getClass())
     case None => throw new CoreException("'video' is required")
+  }
+
+  // Optional game-layer orientation. Absence elaborates the original read path.
+  val coreVideoRotation: Option[UInt] = core.getInterface("videoTransform") match {
+    case Some(transform: VideoTransformV0) => Some(transform.rotation)
+    case Some(x) => throw new CoreException("Unknown 'videoTransform': " + x.getClass())
+    case None => None
   }
 
   // Video filter
@@ -471,7 +478,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
       // Framework status
       0x2000 -> RegisterMap.Entry.r(buttonState),
       0x2004 -> RegisterMap.Entry.r(RegNext(RegNext(io.cartridge.switch))),
-    )
+    ) ++ coreVideoRotation.toSeq.map(rotation => 0x0108 -> RegisterMap.Entry.r(rotation))
   )
 
   val overlayInterface = Wire(new MemoryInterface(addressWidth = 18, dataWidth = 16))
@@ -572,6 +579,15 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
     val framebufferReadAddress = Wire(UInt(log2Ceil(videoWidth * videoHeight).W))
     val overlayReadAddress = Wire(UInt(log2Ceil(overlayWidth * overlayHeight).W))
 
+    val dpiFrameBoundary = coreVideoRotation.map(_ => WireDefault(false.B))
+    val outputRotation = coreVideoRotation.map { request =>
+      val latch = Module(new FrameRotationLatch)
+      latch.io.requested := XpmCdcHandshake.continuous(clock, request)
+      // Both rising vsync edges occur during blanking, before visible read lookahead.
+      latch.io.boundary := dpiFrameBoundary.get
+      latch.io.active
+    }
+
     val audioData = XpmCdcHandshake.continuous(clock, coreAudioData)
 
     // Buffering the read allows this to be a block ram instead of distributed ram
@@ -667,6 +683,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
         }
       }
       val hdmiFramePulse = io.hdmiCy === (hdmiFrameHeight - 1).U
+      dpiFrameBoundary.foreach(_ := hdmiFramePulse && !RegNext(hdmiFramePulse))
       framebufferIndex := regHdmiFrame
       when (hdmiFramePulse && !RegNext(hdmiFramePulse)) {
         regHdmiFrame := lastFrameComplete
@@ -684,6 +701,19 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
         videoX < (videoOffsetX + (videoWidth * videoScale)).U &&
         videoY >= videoOffsetY.U &&
         videoY < (videoOffsetY + (videoHeight * videoScale)).U
+
+      outputRotation.foreach { rotation =>
+        val transform = Module(new FramebufferTransform(videoWidth, videoHeight,
+          screenWidth, screenHeight, delayX = framebufferReadDelay,
+          xBits = videoX.getWidth, yBits = videoY.getWidth))
+        transform.io.x := videoX
+        transform.io.y := videoY
+        transform.io.rotation := rotation
+        when (rotation =/= 0.U) {
+          framebufferReadAddress := transform.io.address
+          framebufferInBounds := transform.io.inBounds
+        }
+      }
 
       // Scale overlay
       val overlayScale = (screenWidth / overlayWidth).min(screenHeight / overlayHeight)
@@ -714,6 +744,7 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
       val dpiY = if (revision.displayRotate) dpiDriverIo.pixelX else dpiDriverIo.pixelY
       videoX := dpiX
       videoY := dpiY
+      dpiFrameBoundary.foreach(_ := dpiDriverIo.signals.vsync && !RegNext(dpiDriverIo.signals.vsync))
       framebufferIndex := dpiDriverIo.displayFrame
 
       // Scale and center framebuffer without output video.
@@ -731,6 +762,20 @@ class HandheldTop[T <: Core](coreFactory: () => T, revision: Revision) extends M
         dpiX < (videoOffsetX + (videoWidth * videoScale)).U &&
         dpiY >= videoOffsetY.U &&
         dpiY < (videoOffsetY + (videoHeight * videoScale)).U
+
+      outputRotation.foreach { rotation =>
+        val transform = Module(new FramebufferTransform(videoWidth, videoHeight,
+          screenWidth, screenHeight, offsetX = revision.displayOffsetX,
+          delayX = framebufferReadDelayX, delayY = framebufferReadDelayY,
+          xBits = dpiX.getWidth, yBits = dpiY.getWidth))
+        transform.io.x := dpiX
+        transform.io.y := dpiY
+        transform.io.rotation := rotation
+        when (rotation =/= 0.U) {
+          framebufferReadAddress := transform.io.address
+          framebufferInBounds := transform.io.inBounds
+        }
+      }
 
       // Scale overlay
       val overlayScale = (screenWidth / overlayWidth).min(screenHeight / overlayHeight)
